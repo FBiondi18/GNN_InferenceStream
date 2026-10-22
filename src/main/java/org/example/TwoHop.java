@@ -121,14 +121,14 @@ public class TwoHop {
         DataStream<Tuple4<Integer,Integer,Integer,Integer>> firstHopNeighbors = parsedStream
                 .keyBy(nodeId -> nodeId)
                 .connect(parsedUpdateStream.keyBy(update -> update.nodeId))
-                .flatMap(new FirstHopFunction(firstHopLimit))
+                .flatMap(new FirstCoHopFunction(firstHopLimit))
                 .uid("stateProcessor1").name("FirstHop");
 
         // 6) Second hop
         DataStream<Tuple4<Integer,Integer,Integer,Integer>> secondHopNeighbors = firstHopNeighbors
                 .keyBy(t -> t.f2)
                 .connect(parsedUpdateStream.keyBy(update -> update.nodeId))
-                .flatMap(new SecondHopFunction(secondHopLimit))
+                .flatMap(new SecondCoHopFunction(secondHopLimit))
                 .returns(TypeInformation.of(new TypeHint<Tuple4<Integer,Integer,Integer,Integer>>(){}))
                 .uid("stateProcessor2").name("SecondHop");
 
@@ -149,7 +149,7 @@ public class TwoHop {
         DataStream<Tuple5<Integer,Integer,Integer,float[],Integer>> finalOutput = finalMergedStream
                 .keyBy(t -> t.f2)
                 .connect(parsedUpdateStream.keyBy(update -> update.nodeId))
-                .flatMap(new FeatureRetrievalFunction())
+                .flatMap(new FeatureCoRetrievalFunction())
                 .returns(TypeInformation.of(new TypeHint<Tuple5<Integer,Integer,Integer,float[],Integer>>(){}))
                 .uid("stateProcessor3").name("FeatureRetrieval");
 
@@ -204,17 +204,59 @@ public class TwoHop {
 
 
     }
-
-    public static class FirstHopFunction extends RichCoFlatMapFunction<
-            Integer,
-            GraphUpdate,
-            Tuple4<Integer,Integer,Integer,Integer>> {
+    
+    public static class FirstHopFunction
+            extends RichFlatMapFunction<Integer, Tuple4<Integer, Integer, Integer, Integer>> {
 
         private transient ListState<Integer> neighborsState;
         private static final Logger logger = LoggerFactory.getLogger(FirstHopFunction.class);
         private final int firstHopLimit;
 
-        public FirstHopFunction(int firstHopLimit) { this.firstHopLimit = firstHopLimit; }
+        public FirstHopFunction(int firstHopLimit) {
+            this.firstHopLimit = firstHopLimit;
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            neighborsState = getRuntimeContext().getListState(
+                    new ListStateDescriptor<>("neighbors", Integer.class));
+        }
+
+        @Override
+        public void flatMap(Integer nodeId, Collector<Tuple4<Integer, Integer, Integer, Integer>> out)
+                throws Exception {
+            List<Integer> neighborIdsList = new ArrayList<>();
+            for (Integer nbr : neighborsState.get()) {
+                neighborIdsList.add(nbr);
+            }
+
+            List<Integer> limitedNeighbors = neighborIdsList.stream()
+                    .limit(firstHopLimit)
+                    .collect(Collectors.toList());
+
+            for (Integer nbr : limitedNeighbors) {
+                out.collect(new Tuple4<>(nodeId, nodeId, nbr, 1));
+            }
+
+            int remaining = firstHopLimit - limitedNeighbors.size();
+            for (int i = 0; i < remaining; i++) {
+                // Instead of sending negative IDs to aggregator
+                int dummyNeighbor = -1 * (i + 1);
+                out.collect(new Tuple4<>(nodeId, nodeId, dummyNeighbor, 1));
+            }
+        }
+    }
+    // FirstCoHopFunction, variation of FirstHopFunction for connected streams
+    public static class FirstCoHopFunction extends RichCoFlatMapFunction<
+            Integer,
+            GraphUpdate,
+            Tuple4<Integer,Integer,Integer,Integer>> {
+
+        private transient ListState<Integer> neighborsState;
+        private static final Logger logger = LoggerFactory.getLogger(FirstCoHopFunction.class);
+        private final int firstHopLimit;
+
+        public FirstCoHopFunction(int firstHopLimit) { this.firstHopLimit = firstHopLimit; }
 
         @Override
         public void open(Configuration parameters) throws Exception {
@@ -254,17 +296,60 @@ public class TwoHop {
         }
     }
 
-    //SecondHopFunction
-    public static class SecondHopFunction extends RichCoFlatMapFunction<
+    public static class SecondHopFunction extends
+            RichFlatMapFunction<Tuple4<Integer, Integer, Integer, Integer>, Tuple4<Integer, Integer, Integer, Integer>> {
+
+        private transient ListState<Integer> neighborsState2;
+        private final int secondHopLimit;
+        private static final Logger logger = LoggerFactory.getLogger(SecondHopFunction.class);
+
+        public SecondHopFunction(int secondHopLimit) {
+            this.secondHopLimit = secondHopLimit;
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            neighborsState2 = getRuntimeContext().getListState(new ListStateDescriptor<>("neighbors2", Integer.class));
+        }
+
+        @Override
+        public void flatMap(Tuple4<Integer, Integer, Integer, Integer> value,
+                Collector<Tuple4<Integer, Integer, Integer, Integer>> out) throws Exception {
+            Integer targetNode = value.f0;
+            Integer firstHopNbr = value.f2;
+
+            List<Integer> neighbors = new ArrayList<>();
+            for (Integer n : neighborsState2.get()) {
+                neighbors.add(n);
+            }
+
+            List<Integer> limited = neighbors.stream()
+                    .limit(secondHopLimit)
+                    .collect(Collectors.toList());
+
+            for (Integer secondHopNbr : limited) {
+                out.collect(new Tuple4<>(targetNode, firstHopNbr, secondHopNbr, 2));
+            }
+
+            int remain = secondHopLimit - limited.size();
+            for (int i = 0; i < remain; i++) {
+                int dummy = -1 * (i + 1);
+                out.collect(new Tuple4<>(targetNode, firstHopNbr, dummy, 2));
+            }
+        }
+    }
+
+    //SecondCoHopFunction, variation of SecondHopFunction for connected streams
+    public static class SecondCoHopFunction extends RichCoFlatMapFunction<
             Tuple4<Integer,Integer,Integer,Integer>,
             GraphUpdate,
             Tuple4<Integer,Integer,Integer,Integer>> {
 
         private transient ListState<Integer> neighborsState2;
         private final int secondHopLimit;
-        private static final Logger logger = LoggerFactory.getLogger(SecondHopFunction.class);
+        private static final Logger logger = LoggerFactory.getLogger(SecondCoHopFunction.class);
 
-        public SecondHopFunction(int secondHopLimit) { this.secondHopLimit = secondHopLimit; }
+        public SecondCoHopFunction(int secondHopLimit) { this.secondHopLimit = secondHopLimit; }
 
         @Override
         public void open(Configuration parameters) throws Exception {
@@ -300,20 +385,51 @@ public class TwoHop {
         @Override
         public void flatMap2(GraphUpdate update, Collector<Tuple4<Integer, Integer, Integer, Integer>> out)
                 throws Exception {
-            logger.info("[FirstHop - Subtask {}] Ricevuto evento (NO-OP): {}",
+            logger.info("[SecondCoHopFunction - Subtask {}] Ricevuto evento (NO-OP): {}",
                     getRuntimeContext().getIndexOfThisSubtask(), update);
         }
     }
 
-
     public static class FeatureRetrievalFunction
+            extends
+            RichFlatMapFunction<Tuple4<Integer, Integer, Integer, Integer>, Tuple5<Integer, Integer, Integer, float[], Integer>> {
+
+        private transient ValueState<float[]> featuresState3;
+        private static final Logger logger = LoggerFactory.getLogger(FeatureRetrievalFunction.class);
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            ValueStateDescriptor<float[]> desc = new ValueStateDescriptor<>(
+                    "featuresState3", TypeInformation.of(new TypeHint<float[]>() {
+                    }));
+            featuresState3 = getRuntimeContext().getState(desc);
+        }
+
+        @Override
+        public void flatMap(Tuple4<Integer, Integer, Integer, Integer> value,
+                Collector<Tuple5<Integer, Integer, Integer, float[], Integer>> out) throws Exception {
+            Integer targetNode = value.f0;
+            Integer sourceNode = value.f1;
+            Integer neighborId = value.f2;
+            int hopCount = value.f3;
+
+            float[] feats = (featuresState3.value() == null)
+                    ? new float[602]
+                    : featuresState3.value();
+
+            out.collect(new Tuple5<>(targetNode, sourceNode, neighborId, feats, hopCount));
+        }
+    }
+
+    // FeatureCoRetrievalFunction, variation of FeatureRetrievalFunction for connected streams
+    public static class FeatureCoRetrievalFunction
             extends RichCoFlatMapFunction<
             Tuple4<Integer,Integer,Integer,Integer>,
             GraphUpdate,
             Tuple5<Integer,Integer,Integer,float[],Integer> > {
 
         private transient ValueState<float[]> featuresState3;
-        private static final Logger logger = LoggerFactory.getLogger(FeatureRetrievalFunction.class);
+        private static final Logger logger = LoggerFactory.getLogger(FeatureCoRetrievalFunction.class);
 
         @Override
         public void open(Configuration parameters) throws Exception {
@@ -341,7 +457,7 @@ public class TwoHop {
         @Override
         public void flatMap2(GraphUpdate update, Collector<Tuple5<Integer, Integer, Integer, float[], Integer>> out)
                 throws Exception {
-            logger.info("[FirstHop - Subtask {}] Ricevuto evento (NO-OP): {}",
+            logger.info("[FeatureRetrievalFunction - Subtask {}] Ricevuto evento (NO-OP): {}",
                     getRuntimeContext().getIndexOfThisSubtask(), update);
         }
     }
