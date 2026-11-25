@@ -104,8 +104,13 @@ public class TwoHop {
         DataStream<String> rawUpdateStream = env.addSource(new SyntheticGraphUpdateSource())
                 .name("Synthetic Graph Update Source")
                 .assignTimestampsAndWatermarks(
-                    WatermarkStrategy.noWatermarks())   
-                .setParallelism(1);
+                        WatermarkStrategy
+                                .<String>forMonotonousTimestamps()
+                                .withTimestampAssigner((record, ts) -> {
+                                    String[] parts = record.split(",", 5);
+                                    return Long.parseLong(parts[4]);
+                                })
+                ).setParallelism(1);
 
         DataStream<GraphUpdate> parsedUpdateStream = rawUpdateStream
                 .map(GraphUpdate::fromCsv)
